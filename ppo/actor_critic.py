@@ -74,12 +74,12 @@ class MLPCritic(nn.Module):
         """Returns estimated values of observations.
 
         Args:
-            obs (Observation): Observed state. (batch_size, obs_dim)
+            obs (Observation): Observed state. (batch_size, obs_dim) or (obs_dim,)
 
         Returns:
-            torch.Tensor: estimated values. (batch_size,)
+            torch.Tensor: estimated values. (batch_size,) or ()
         """
-        return self.v_net(obs).squeeze(1)
+        return self.v_net(obs).squeeze(-1)
 
 
 class MLPActorCritic(nn.Module):
@@ -96,7 +96,7 @@ class MLPActorCritic(nn.Module):
         self.pi = MLPCategoricalActor(obs_dim, action_space.n, hidden_sizes, activation)
         self.v = MLPCritic(obs_dim, hidden_sizes, activation)
 
-    @torch.no_grad
+    @torch.no_grad()
     def step(self, obs: Observation) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Step
 
