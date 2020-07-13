@@ -1,5 +1,5 @@
-from functools import update_wrapper
 from typing import NamedTuple
+import dataclasses
 
 import numpy as np
 import torch
@@ -18,9 +18,7 @@ class Experience(NamedTuple):
 
 
 class Buffer:
-    def __init__(
-        self, obs_dim: int, act_dim: int, size: int, gamma=0.99, lam=0.95
-    ) -> None:
+    def __init__(self, obs_dim: int, size: int, gamma=0.99, lam=0.95) -> None:
         self.obs_buf = np.zeros((size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(size, dtype=np.float32)
         self.reward_buf = np.zeros(size, dtype=np.float32)
@@ -63,55 +61,92 @@ class Buffer:
         )
 
 
-def compute_loss(actor: model.Actor, experience: Experience) -> torch.Tensor:
+class Trainer:
+    @dataclasses.dataclass
+    class Config:
+        epochs: int
+        steps_per_epoch: int
+        updates_per_step: int = 10
+        render: bool = False
+
+    def __init__(self, ac: model.ActorCritic, env: gym.Env, config: Config) -> None:
+        self.ac = ac
+        self.env = env
+        self.config = config
+        self.actor_optimizer = optim.Adam(self.ac.actor.parameters())
+        self.obs_dim = env.observation_space.shape[0]
+        self.writer = tensorboard.SummaryWriter()
+        self.global_step = 0
+
+    def _train_one_epoch(self, epoch: int):
+        print(f"Epoch {epoch}")
+        buffer = Buffer(self.obs_dim, self.config.steps_per_epoch)
+        obs = self.env.reset()
+        episode_rewards = []
+        is_first_episode = True
+        for step in range(self.config.steps_per_epoch):
+            self.global_step += 1
+            if self.config.render and epoch % 10 == 0 and is_first_episode:
+                self.env.render()
+            act = self.ac.act(torch.as_tensor(obs, dtype=torch.float))
+            next_obs, reward, done, _ = self.env.step(act)
+            buffer.store(obs, act, reward)
+            obs = next_obs
+            if is_first_episode:
+                episode_rewards.append(reward)
+            terminated = step == self.config.steps_per_epoch - 1
+            if done or terminated:
+                buffer.finish_path()
+            if done:
+                is_first_episode = False
+                obs = self.env.reset()
+        experience = buffer.get()
+        average_loss = 0
+        for _ in range(self.config.updates_per_step):
+            self.actor_optimizer.zero_grad()
+            loss = _compute_loss(self.ac.actor, experience)
+            loss.backward()
+            self.actor_optimizer.step()
+            average_loss += loss.detach().item() / self.config.updates_per_step
+
+        print(f"EpRew: {np.sum(episode_rewards)}, Loss: {average_loss}")
+        self.writer.add_scalar(
+            "EpRew", np.sum(episode_rewards), global_step=self.global_step
+        )
+        self.writer.add_scalar("Loss", average_loss, global_step=self.global_step)
+
+    def train(self):
+        for epoch in range(1, 1 + self.config.epochs):
+            self._train_one_epoch(epoch)
+
+
+def _compute_loss(actor: model.Actor, experience: Experience) -> torch.Tensor:
     _, logp = actor(experience.obs, experience.act)
     return -(logp * experience.ret).mean()
 
 
-def main(env_name: str, epochs: int, steps_per_epoch: int = 500, updates_per_step: int = 10):
-    writer = tensorboard.SummaryWriter()
-
+def main(
+    env_name: str,
+    epochs: int,
+    steps_per_epoch: int = 500,
+    updates_per_step: int = 10,
+    render: bool = False,
+):
     env = gym.make(env_name)
     obs_dim = env.observation_space.shape[0]
     assert isinstance(env.action_space, spaces.Discrete)
-    act_dim = env.action_space.n
-
-    policy = model.ActorCritic(obs_dim, act_dim)
-    actor_optimizer = optim.Adam(policy.actor.parameters())
-
-    for epoch in range(1, epochs + 1):
-        print(f"Epoch {epoch}")
-        buf = Buffer(obs_dim, act_dim, size=steps_per_epoch)
-        obs = env.reset()
-        episode_rewards = []
-        is_first_episode = True
-        for step in range(steps_per_epoch):
-            if epoch % 10 == 0 and is_first_episode:
-                env.render()
-            act = policy.act(torch.as_tensor(obs, dtype=torch.float))
-            next_obs, reward, done, _ = env.step(act)
-            buf.store(obs, act, reward)
-            obs = next_obs
-            if is_first_episode:
-                episode_rewards.append(reward)
-            terminated = step == steps_per_epoch - 1
-            if done or terminated:
-                buf.finish_path()
-            if done:
-                is_first_episode = False
-                obs = env.reset()
-        average_loss = 0
-        for _ in range(updates_per_step):
-            actor_optimizer.zero_grad()
-            loss = compute_loss(policy.actor, buf.get())
-            loss.backward()
-            actor_optimizer.step()
-            average_loss += loss.detach().item() / updates_per_step
-
-        print(f"EpRew: {np.sum(episode_rewards)}, Loss: {average_loss}")
-        writer.add_scalar("EpRew", np.sum(episode_rewards))
-        writer.add_scalar("Loss", average_loss)
-
+    ac = model.ActorCritic(obs_dim, env.action_space.n)
+    trainer = Trainer(
+        ac,
+        env,
+        Trainer.Config(
+            epochs=epochs,
+            steps_per_epoch=steps_per_epoch,
+            updates_per_step=updates_per_step,
+            render=render,
+        ),
+    )
+    trainer.train()
 
 
 if __name__ == "__main__":
