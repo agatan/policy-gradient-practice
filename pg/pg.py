@@ -1,4 +1,4 @@
-from typing import NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional, Tuple, Callable, List
 import dataclasses
 from concurrent import futures
 
@@ -117,6 +117,7 @@ class Buffer:
 
 @dataclasses.dataclass
 class TrainerConfig:
+    num_cpu: int
     epochs: int
     steps_per_epoch: int
     updates_per_step: int
@@ -176,27 +177,58 @@ class Actor:
         return reward, experience
 
 
+def _concat_experiences(experiences: List[Experience]) -> Experience:
+    return Experience(
+        obs=torch.cat([e.obs for e in experiences], dim=0),
+        act=torch.cat([e.act for e in experiences], dim=0),
+        ret=torch.cat([e.ret for e in experiences], dim=0),
+        advantages=torch.cat([e.advantages for e in experiences], dim=0),
+        values=torch.cat([e.values for e in experiences], dim=0),
+        logp=torch.cat([e.logp for e in experiences], dim=0),
+    )
+
+
+def run_actors(epoch: int, actors: List[Actor], config: TrainerConfig) -> Tuple[float, Experience]:
+    with futures.ProcessPoolExecutor(config.num_cpu) as executor:
+        tasks = []
+        for i, actor in enumerate(actors):
+            task = executor.submit(
+                actor.get_experience,
+                config.steps_per_epoch,
+                config.use_reward_to_go,
+                config.use_actor_critic,
+                i == 0 and config.render and epoch % 10 == 0,
+            )
+            tasks.append(task)
+        experiences = []
+        episode_reward = 0
+        for i, task in enumerate(tasks):
+            r, exp = task.result()
+            if i == 0:
+                episode_reward = r
+            experiences.append(exp)
+    experience = _concat_experiences(experiences)
+    return episode_reward, experience
+
+
 class Trainer:
     def __init__(
-        self, ac: model.ActorCritic, env: gym.Env, config: TrainerConfig
+        self,
+        ac: model.ActorCritic,
+        env_fn: Callable[[], gym.Env],
+        config: TrainerConfig,
     ) -> None:
         self.ac = ac
-        self.actor = Actor(env, ac)
+        self.actors = [Actor(env_fn(), ac) for _ in range(config.num_cpu)]
         self.config = config
         self.actor_optimizer = optim.Adam(self.ac.actor.parameters())
         self.critic_optimizer = optim.Adam(self.ac.critic.parameters())
-        self.obs_dim = env.observation_space.shape[0]
         self.writer = tensorboard.SummaryWriter()
         self.global_step = 0
 
     def _train_one_epoch(self, epoch: int):
         print(f"Epoch {epoch}")
-        episode_reward, experience = self.actor.get_experience(
-            self.config.steps_per_epoch,
-            self.config.use_reward_to_go,
-            self.config.use_actor_critic,
-            self.config.render and epoch % 10 == 0,
-        )
+        episode_reward, experience = run_actors(epoch, self.actors, self.config)
         average_actor_loss = 0
         average_critic_loss = 0
         for _ in range(self.config.updates_per_step):
@@ -266,15 +298,18 @@ def main():
     parser.add_argument("--disable_reward_to_go", action="store_true")
     parser.add_argument("--disable_actor_critic", action="store_true")
     parser.add_argument("--disable_ppo", action="store_true")
+    parser.add_argument("--num_cpu", type=int, default=4)
     args = parser.parse_args()
-    env = gym.make(args.env)
+    env_fn = lambda: gym.make(args.env)
+    env = env_fn()
     obs_dim = env.observation_space.shape[0]
     assert isinstance(env.action_space, spaces.Discrete)
     ac = model.ActorCritic(obs_dim, env.action_space.n)
     trainer = Trainer(
         ac,
-        env,
+        env_fn,
         TrainerConfig(
+            num_cpu=args.num_cpu,
             epochs=args.epochs,
             steps_per_epoch=args.steps_per_epoch,
             updates_per_step=args.updates_per_step,
