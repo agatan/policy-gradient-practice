@@ -8,7 +8,7 @@ from torch.utils import tensorboard
 import gym
 from gym import spaces
 
-from vpg import model
+from pg import model
 
 
 class Experience(NamedTuple):
