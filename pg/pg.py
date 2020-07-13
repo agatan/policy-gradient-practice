@@ -7,6 +7,7 @@ from torch import optim
 from torch.utils import tensorboard
 import gym
 from gym import spaces
+import scipy.signal
 
 from pg import model
 
@@ -17,12 +18,29 @@ class Experience(NamedTuple):
     ret: torch.Tensor
 
 
+def _discount_cumsum(x, discount):
+    """
+    magic from rllab for computing discounted cumulative sums of vectors.
+    input:
+        vector x,
+        [x0,
+         x1,
+         x2]
+    output:
+        [x0 + discount * x1 + discount^2 * x2,
+         x1 + discount * x2,
+         x2]
+    """
+    return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
+
+
 class Buffer:
-    def __init__(self, obs_dim: int, size: int, gamma=0.99, lam=0.95) -> None:
+    def __init__(self, obs_dim: int, size: int, use_reward_to_go: bool, gamma=0.99, lam=0.95) -> None:
         self.obs_buf = np.zeros((size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(size, dtype=np.float32)
         self.reward_buf = np.zeros(size, dtype=np.float32)
         self.return_buf = np.zeros(size, dtype=np.float32)
+        self.use_reward_to_go = use_reward_to_go
         self.gamma = gamma
         self.lam = lam
         self.ptr = 0
@@ -48,8 +66,11 @@ class Buffer:
         """
         path_slice = slice(self.path_start_idx, self.ptr)
         rewards = self.reward_buf[path_slice]
-        r = np.sum(rewards)
-        self.return_buf[path_slice] = r
+        if self.use_reward_to_go:
+            self.return_buf[path_slice] = _discount_cumsum(rewards, self.gamma)
+        else:
+            r = np.sum(rewards)
+            self.return_buf[path_slice] = r
         self.path_start_idx = self.ptr
 
     def get(self) -> Experience:
@@ -66,8 +87,9 @@ class Trainer:
     class Config:
         epochs: int
         steps_per_epoch: int
-        updates_per_step: int = 10
-        render: bool = False
+        updates_per_step: int
+        render: bool
+        use_reward_to_go: bool
 
     def __init__(self, ac: model.ActorCritic, env: gym.Env, config: Config) -> None:
         self.ac = ac
@@ -80,7 +102,7 @@ class Trainer:
 
     def _train_one_epoch(self, epoch: int):
         print(f"Epoch {epoch}")
-        buffer = Buffer(self.obs_dim, self.config.steps_per_epoch)
+        buffer = Buffer(self.obs_dim, self.config.steps_per_epoch, self.config.use_reward_to_go)
         obs = self.env.reset()
         episode_rewards = []
         is_first_episode = True
@@ -131,6 +153,7 @@ def main(
     steps_per_epoch: int = 500,
     updates_per_step: int = 10,
     render: bool = False,
+    use_reward_to_go: bool = True,
 ):
     env = gym.make(env_name)
     obs_dim = env.observation_space.shape[0]
@@ -144,6 +167,7 @@ def main(
             steps_per_epoch=steps_per_epoch,
             updates_per_step=updates_per_step,
             render=render,
+            use_reward_to_go=use_reward_to_go,
         ),
     )
     trainer.train()
