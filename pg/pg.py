@@ -1,4 +1,4 @@
-from typing import NamedTuple
+from typing import NamedTuple, Optional, Tuple
 import dataclasses
 
 import numpy as np
@@ -19,6 +19,7 @@ class Experience(NamedTuple):
     ret: torch.Tensor
     advantages: torch.Tensor
     values: torch.Tensor
+    logp: torch.Tensor
 
 
 def _discount_cumsum(x, discount):
@@ -51,6 +52,7 @@ class Buffer:
         self.act_buf = np.zeros(size, dtype=np.float32)
         self.reward_buf = np.zeros(size, dtype=np.float32)
         self.value_buf = np.zeros(size, dtype=np.float32)
+        self.logp_buf = np.zeros(size, dtype=np.float32)
         self.return_buf = np.zeros(size, dtype=np.float32)
         self.adv_buf = np.zeros(size, dtype=np.float32)
         self.use_reward_to_go = use_reward_to_go
@@ -62,7 +64,7 @@ class Buffer:
         self.max_size = size
 
     def store(
-        self, obs: np.ndarray, act: np.ndarray, reward: float, value: float
+        self, obs: np.ndarray, act: np.ndarray, reward: float, value: float, logp: float
     ) -> None:
         """Store an experience.
 
@@ -71,12 +73,14 @@ class Buffer:
             act (np.ndarray): Selected action.
             reward (float): Acquired reward.
             value (float): Estimated value.
+            logp (float): log probability of the selected action in the current policy.
         """
         assert self.ptr < self.max_size
         self.obs_buf[self.ptr] = obs
         self.act_buf[self.ptr] = act
         self.reward_buf[self.ptr] = reward
         self.value_buf[self.ptr] = value
+        self.logp_buf[self.ptr] = logp
         self.ptr += 1
 
     def finish_path(self, last_value: float) -> None:
@@ -106,6 +110,7 @@ class Buffer:
             ret=torch.as_tensor(self.return_buf, dtype=torch.float),
             advantages=torch.as_tensor(self.adv_buf, dtype=torch.float),
             values=torch.as_tensor(self.value_buf, dtype=torch.float),
+            logp=torch.as_tensor(self.logp_buf, dtype=torch.float),
         )
 
 
@@ -117,6 +122,7 @@ class TrainerConfig:
     render: bool
     use_reward_to_go: bool
     use_actor_critic: bool
+    use_ppo: bool
 
 
 class Trainer:
@@ -127,6 +133,7 @@ class Trainer:
         self.env = env
         self.config = config
         self.actor_optimizer = optim.Adam(self.ac.actor.parameters())
+        self.critic_optimizer = optim.Adam(self.ac.critic.parameters())
         self.obs_dim = env.observation_space.shape[0]
         self.writer = tensorboard.SummaryWriter()
         self.global_step = 0
@@ -146,9 +153,9 @@ class Trainer:
             self.global_step += 1
             if self.config.render and epoch % 10 == 0 and is_first_episode:
                 self.env.render()
-            act, value, _ = self.ac.step(torch.as_tensor(obs, dtype=torch.float))
+            act, value, logp = self.ac.step(torch.as_tensor(obs, dtype=torch.float))
             next_obs, reward, done, _ = self.env.step(act)
-            buffer.store(obs, act, reward, value)
+            buffer.store(obs, act, reward, value, logp)
             obs = next_obs
             if is_first_episode:
                 episode_rewards.append(reward)
@@ -161,21 +168,38 @@ class Trainer:
                 is_first_episode = False
                 obs = self.env.reset()
         experience = buffer.get()
-        average_loss = 0
+        average_actor_loss = 0
+        average_critic_loss = 0
         for _ in range(self.config.updates_per_step):
             self.actor_optimizer.zero_grad()
-            loss = _compute_loss(
-                self.ac, experience, self.config.use_actor_critic
+            self.critic_optimizer.zero_grad()
+            actor_loss, critic_loss = _compute_loss(
+                self.ac, experience, self.config.use_actor_critic, self.config.use_ppo
             )
-            loss.backward()
+            actor_loss.backward()
             self.actor_optimizer.step()
-            average_loss += loss.detach().item() / self.config.updates_per_step
+            average_actor_loss += (
+                actor_loss.detach().item() / self.config.updates_per_step
+            )
+            if critic_loss is not None:
+                critic_loss.backward()
+                self.critic_optimizer.step()
+                average_critic_loss += (
+                    critic_loss.detach().item() / self.config.updates_per_step
+                )
 
-        print(f"EpRew: {np.sum(episode_rewards)}, Loss: {average_loss}")
+        print(
+            f"EpRew: {np.sum(episode_rewards)}, Actor Loss: {average_actor_loss}, Critic Loss: {average_critic_loss}"
+        )
         self.writer.add_scalar(
             "EpRew", np.sum(episode_rewards), global_step=self.global_step
         )
-        self.writer.add_scalar("Loss", average_loss, global_step=self.global_step)
+        self.writer.add_scalar(
+            "Actor Loss", average_actor_loss, global_step=self.global_step
+        )
+        self.writer.add_scalar(
+            "Critic Loss", average_critic_loss, global_step=self.global_step
+        )
 
     def train(self):
         for epoch in range(1, 1 + self.config.epochs):
@@ -183,16 +207,20 @@ class Trainer:
 
 
 def _compute_loss(
-    ac: model.ActorCritic, experience: Experience, use_actor_critic: bool
-) -> torch.Tensor:
+    ac: model.ActorCritic, experience: Experience, use_actor_critic: bool, use_ppo: bool
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     _, logp = ac.actor(experience.obs, experience.act)
-    a = experience.advantages if use_actor_critic else experience.ret
-    loss = -(logp * a).mean()
+    if use_actor_critic and use_ppo:
+        ratio = torch.exp(logp - experience.logp)
+        a = torch.clamp(ratio, 1 - 0.2, 1 + 0.2) * experience.advantages
+        actor_loss = -(torch.min(ratio * experience.advantages, a)).mean()
+    else:
+        actor_loss = -(logp * experience.ret).mean()
+    critic_loss = None
     if use_actor_critic:
         values = ac.critic(experience.obs)
-        critic_loss = F.smooth_l1_loss(values, experience.ret)
-        loss += critic_loss
-    return loss
+        critic_loss = F.mse_loss(values, experience.ret)
+    return actor_loss, critic_loss
 
 
 @dataclasses.dataclass
@@ -212,6 +240,7 @@ def main():
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--disable_reward_to_go", action="store_true")
     parser.add_argument("--disable_actor_critic", action="store_true")
+    parser.add_argument("--disable_ppo", action="store_true")
     args = parser.parse_args()
     env = gym.make(args.env)
     obs_dim = env.observation_space.shape[0]
@@ -226,6 +255,7 @@ def main():
             updates_per_step=args.updates_per_step,
             use_reward_to_go=not args.disable_reward_to_go,
             use_actor_critic=not args.disable_actor_critic,
+            use_ppo=not args.disable_ppo,
             render=args.render,
         ),
     )
