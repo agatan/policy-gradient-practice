@@ -35,7 +35,9 @@ def _discount_cumsum(x, discount):
 
 
 class Buffer:
-    def __init__(self, obs_dim: int, size: int, use_reward_to_go: bool, gamma=0.99, lam=0.95) -> None:
+    def __init__(
+        self, obs_dim: int, size: int, use_reward_to_go: bool, gamma=0.99, lam=0.95
+    ) -> None:
         self.obs_buf = np.zeros((size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(size, dtype=np.float32)
         self.reward_buf = np.zeros(size, dtype=np.float32)
@@ -82,16 +84,19 @@ class Buffer:
         )
 
 
-class Trainer:
-    @dataclasses.dataclass
-    class Config:
-        epochs: int
-        steps_per_epoch: int
-        updates_per_step: int
-        render: bool
-        use_reward_to_go: bool
+@dataclasses.dataclass
+class TrainerConfig:
+    epochs: int
+    steps_per_epoch: int
+    updates_per_step: int
+    render: bool
+    use_reward_to_go: bool
 
-    def __init__(self, ac: model.ActorCritic, env: gym.Env, config: Config) -> None:
+
+class Trainer:
+    def __init__(
+        self, ac: model.ActorCritic, env: gym.Env, config: TrainerConfig
+    ) -> None:
         self.ac = ac
         self.env = env
         self.config = config
@@ -102,7 +107,9 @@ class Trainer:
 
     def _train_one_epoch(self, epoch: int):
         print(f"Epoch {epoch}")
-        buffer = Buffer(self.obs_dim, self.config.steps_per_epoch, self.config.use_reward_to_go)
+        buffer = Buffer(
+            self.obs_dim, self.config.steps_per_epoch, self.config.use_reward_to_go
+        )
         obs = self.env.reset()
         episode_rewards = []
         is_first_episode = True
@@ -147,31 +154,40 @@ def _compute_loss(actor: model.Actor, experience: Experience) -> torch.Tensor:
     return -(logp * experience.ret).mean()
 
 
-def main(
-    env_name: str,
-    epochs: int,
-    steps_per_epoch: int = 500,
-    updates_per_step: int = 10,
-    render: bool = False,
-    use_reward_to_go: bool = True,
-):
-    env = gym.make(env_name)
+@dataclasses.dataclass
+class Config:
+    trainer: TrainerConfig
+    env_name: str = "CartPole-v0"
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--env", default="CartPole-v0")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--steps_per_epoch", type=int, default=500)
+    parser.add_argument("--updates_per_step", type=int, default=10)
+    parser.add_argument("--render", action="store_true")
+    parser.add_argument("--disable_reward_to_go", action="store_true")
+    args = parser.parse_args()
+    env = gym.make(args.env)
     obs_dim = env.observation_space.shape[0]
     assert isinstance(env.action_space, spaces.Discrete)
     ac = model.ActorCritic(obs_dim, env.action_space.n)
     trainer = Trainer(
         ac,
         env,
-        Trainer.Config(
-            epochs=epochs,
-            steps_per_epoch=steps_per_epoch,
-            updates_per_step=updates_per_step,
-            render=render,
-            use_reward_to_go=use_reward_to_go,
+        TrainerConfig(
+            epochs=args.epochs,
+            steps_per_epoch=args.steps_per_epoch,
+            updates_per_step=args.updates_per_step,
+            use_reward_to_go=not args.disable_reward_to_go,
+            render=args.render,
         ),
     )
     trainer.train()
 
 
 if __name__ == "__main__":
-    main("CartPole-v0", 200)
+    main()
