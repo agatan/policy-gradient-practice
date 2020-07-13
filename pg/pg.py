@@ -1,5 +1,6 @@
 from typing import NamedTuple, Optional, Tuple
 import dataclasses
+from concurrent import futures
 
 import numpy as np
 import torch
@@ -125,12 +126,62 @@ class TrainerConfig:
     use_ppo: bool
 
 
+class Actor:
+    def __init__(self, env: gym.Env, ac: model.ActorCritic) -> None:
+        self.env = env
+        self.ac = ac
+        self.obs_dim = env.observation_space.shape[0]
+
+    def get_experience(
+        self,
+        steps_per_epoch: int,
+        use_reward_to_go: bool,
+        use_actor_critic: bool,
+        render: bool,
+    ) -> Tuple[float, Experience]:
+        """Get an experience for required steps.
+
+        Args:
+            steps_per_epoch (int): [description]
+
+        Returns:
+            float: the reward of the first episode.
+            Experience: the corrected experience.
+        """
+        buffer = Buffer(
+            self.obs_dim, steps_per_epoch, use_reward_to_go, use_actor_critic
+        )
+        is_first_episode = True
+        episode_rewards = []
+        obs = self.env.reset()
+        for step in range(steps_per_epoch):
+            if render and is_first_episode:
+                self.env.render()
+            act, value, logp = self.ac.step(torch.as_tensor(obs, dtype=torch.float))
+            next_obs, reward, done, _ = self.env.step(act)
+            buffer.store(obs, act, reward, value, logp)
+            obs = next_obs
+            if is_first_episode:
+                episode_rewards.append(reward)
+            terminated = step == steps_per_epoch - 1
+            if terminated and not done:
+                _, value, _ = self.ac.step(torch.as_tensor(obs, dtype=torch.float))
+                buffer.finish_path(value)
+            if done:
+                buffer.finish_path(0)
+                is_first_episode = False
+                obs = self.env.reset()
+        experience = buffer.get()
+        reward = np.sum(episode_rewards)
+        return reward, experience
+
+
 class Trainer:
     def __init__(
         self, ac: model.ActorCritic, env: gym.Env, config: TrainerConfig
     ) -> None:
         self.ac = ac
-        self.env = env
+        self.actor = Actor(env, ac)
         self.config = config
         self.actor_optimizer = optim.Adam(self.ac.actor.parameters())
         self.critic_optimizer = optim.Adam(self.ac.critic.parameters())
@@ -140,34 +191,12 @@ class Trainer:
 
     def _train_one_epoch(self, epoch: int):
         print(f"Epoch {epoch}")
-        buffer = Buffer(
-            self.obs_dim,
+        episode_reward, experience = self.actor.get_experience(
             self.config.steps_per_epoch,
             self.config.use_reward_to_go,
             self.config.use_actor_critic,
+            self.config.render and epoch % 10 == 0,
         )
-        obs = self.env.reset()
-        episode_rewards = []
-        is_first_episode = True
-        for step in range(self.config.steps_per_epoch):
-            self.global_step += 1
-            if self.config.render and epoch % 10 == 0 and is_first_episode:
-                self.env.render()
-            act, value, logp = self.ac.step(torch.as_tensor(obs, dtype=torch.float))
-            next_obs, reward, done, _ = self.env.step(act)
-            buffer.store(obs, act, reward, value, logp)
-            obs = next_obs
-            if is_first_episode:
-                episode_rewards.append(reward)
-            terminated = step == self.config.steps_per_epoch - 1
-            if terminated and not done:
-                _, value, _ = self.ac.step(torch.as_tensor(obs, dtype=torch.float))
-                buffer.finish_path(value)
-            if done:
-                buffer.finish_path(0)
-                is_first_episode = False
-                obs = self.env.reset()
-        experience = buffer.get()
         average_actor_loss = 0
         average_critic_loss = 0
         for _ in range(self.config.updates_per_step):
@@ -189,14 +218,10 @@ class Trainer:
                 )
 
         print(
-            f"EpRew: {np.sum(episode_rewards)}, Actor Loss: {average_actor_loss}, Critic Loss: {average_critic_loss}"
+            f"EpRew: {episode_reward}, Actor Loss: {average_actor_loss}, Critic Loss: {average_critic_loss}"
         )
-        self.writer.add_scalar(
-            "EpRew", np.sum(episode_rewards), global_step=self.global_step
-        )
-        self.writer.add_scalar(
-            "Actor Loss", average_actor_loss, global_step=self.global_step
-        )
+        self.writer.add_scalar("EpRew", episode_reward, global_step=epoch)
+        self.writer.add_scalar("Actor Loss", average_actor_loss, global_step=epoch)
         self.writer.add_scalar(
             "Critic Loss", average_critic_loss, global_step=self.global_step
         )
