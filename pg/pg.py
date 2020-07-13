@@ -79,7 +79,7 @@ class Buffer:
         self.value_buf[self.ptr] = value
         self.ptr += 1
 
-    def finish_path(self) -> None:
+    def finish_path(self, last_value: float) -> None:
         """Call this method to annotate current path is finished.
         """
         path_slice = slice(self.path_start_idx, self.ptr)
@@ -89,13 +89,17 @@ class Buffer:
         else:
             r = np.sum(rewards)
             self.return_buf[path_slice] = r
-        self.adv_buf[path_slice] = (
-            self.return_buf[path_slice] - self.value_buf[path_slice]
-        )
+        rews = np.append(self.reward_buf[path_slice], last_value)
+        vals = np.append(self.value_buf[path_slice], last_value)
+        deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
+        self.adv_buf[path_slice] = _discount_cumsum(deltas, self.gamma * self.lam)
         self.path_start_idx = self.ptr
 
     def get(self) -> Experience:
         assert self.ptr == self.max_size
+        self.ptr = 0
+        self.path_start_idx = 0
+        self.adv_buf = (self.adv_buf - np.mean(self.adv_buf)) / np.std(self.adv_buf)
         return Experience(
             obs=torch.as_tensor(self.obs_buf, dtype=torch.float),
             act=torch.as_tensor(self.act_buf, dtype=torch.float),
@@ -149,9 +153,11 @@ class Trainer:
             if is_first_episode:
                 episode_rewards.append(reward)
             terminated = step == self.config.steps_per_epoch - 1
-            if done or terminated:
-                buffer.finish_path()
+            if terminated and not done:
+                _, value, _ = self.ac.step(torch.as_tensor(obs, dtype=torch.float))
+                buffer.finish_path(value)
             if done:
+                buffer.finish_path(0)
                 is_first_episode = False
                 obs = self.env.reset()
         experience = buffer.get()
