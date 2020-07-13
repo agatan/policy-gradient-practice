@@ -61,7 +61,7 @@ class MLPCritic(nn.Module):
         self.value_function = _mlp([obs_dim] + list(hidden_sizes) + [1], activation)
 
     def forward(self, obs):
-        return self.value_function(obs)
+        return self.value_function(obs).squeeze(-1)
 
 
 class ActorCritic(nn.Module):
