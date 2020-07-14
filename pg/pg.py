@@ -127,6 +127,7 @@ class TrainerConfig:
     use_ppo: bool
     vf_coeff: float
     ent_coeff: float
+    max_grad_norm: float
 
 
 class Actor:
@@ -204,7 +205,7 @@ def run_actors(
                     config.steps_per_epoch,
                     config.use_reward_to_go,
                     config.use_actor_critic,
-                    render=False
+                    render=False,
                 )
                 tasks.append(task)
             else:
@@ -251,12 +252,20 @@ class Trainer:
                 self.ac, experience, self.config.use_actor_critic, self.config.use_ppo
             )
             (actor_loss - self.config.ent_coeff * entropy).backward()
+            if self.config.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.ac.actor.parameters(), self.config.max_grad_norm
+                )
             self.actor_optimizer.step()
             average_actor_loss += (
                 actor_loss.detach().item() / self.config.updates_per_step
             )
             if critic_loss is not None:
                 (critic_loss * self.config.vf_coeff).backward()
+                if self.config.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.ac.critic.parameters(), self.config.max_grad_norm
+                    )
                 self.critic_optimizer.step()
                 average_critic_loss += (
                     critic_loss.detach().item() / self.config.updates_per_step
@@ -315,6 +324,7 @@ def main():
     parser.add_argument("--num_cpu", type=int, default=4)
     parser.add_argument("--vf_coeff", type=float, default=0.5)
     parser.add_argument("--ent_coeff", type=float, default=0.01)
+    parser.add_argument("--max_grad_norm", type=float, default=0.5)
     args = parser.parse_args()
     env_fn = lambda: gym.make(args.env)
     env = env_fn()
@@ -335,6 +345,7 @@ def main():
             render=args.render,
             vf_coeff=args.vf_coeff,
             ent_coeff=args.ent_coeff,
+            max_grad_norm=args.max_grad_norm,
         ),
     )
     trainer.train()
