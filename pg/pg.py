@@ -128,6 +128,7 @@ class TrainerConfig:
     vf_coeff: float
     ent_coeff: float
     max_grad_norm: float
+    approx_kl_threshold: float
 
 
 class Actor:
@@ -245,12 +246,15 @@ class Trainer:
         episode_reward, experience = run_actors(epoch, self.actors, self.config)
         average_actor_loss = 0
         average_critic_loss = 0
-        for _ in range(self.config.updates_per_step):
+        for i in range(self.config.updates_per_step):
             self.actor_optimizer.zero_grad()
             self.critic_optimizer.zero_grad()
-            actor_loss, entropy, critic_loss = _compute_loss(
+            actor_loss, entropy, critic_loss, approx_kl = _compute_loss(
                 self.ac, experience, self.config.use_actor_critic, self.config.use_ppo
             )
+            if approx_kl > self.config.approx_kl_threshold:
+                print(f"KL Divergence threshold exceeded at {i}: {approx_kl:.4f}")
+                break
             (actor_loss - self.config.ent_coeff * entropy).backward()
             if self.config.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
@@ -287,8 +291,9 @@ class Trainer:
 
 def _compute_loss(
     ac: model.ActorCritic, experience: Experience, use_actor_critic: bool, use_ppo: bool
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], float]:
     pi, logp = ac.actor(experience.obs, experience.act)
+    approx_kl = (experience.logp - logp).mean().item()
     if use_actor_critic and use_ppo:
         ratio = torch.exp(logp - experience.logp)
         a = torch.clamp(ratio, 1 - 0.2, 1 + 0.2) * experience.advantages
@@ -300,7 +305,7 @@ def _compute_loss(
     if use_actor_critic:
         values = ac.critic(experience.obs)
         critic_loss = F.mse_loss(values, experience.ret)
-    return actor_loss, entropy, critic_loss
+    return actor_loss, entropy, critic_loss, approx_kl
 
 
 @dataclasses.dataclass
@@ -325,6 +330,7 @@ def main():
     parser.add_argument("--vf_coeff", type=float, default=0.5)
     parser.add_argument("--ent_coeff", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=0.5)
+    parser.add_argument("--approx_kl_threshold", type=float, default=0.015)
     args = parser.parse_args()
     env_fn = lambda: gym.make(args.env)
     env = env_fn()
@@ -346,6 +352,7 @@ def main():
             vf_coeff=args.vf_coeff,
             ent_coeff=args.ent_coeff,
             max_grad_norm=args.max_grad_norm,
+            approx_kl_threshold=args.approx_kl_threshold,
         ),
     )
     trainer.train()
