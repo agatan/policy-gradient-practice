@@ -125,6 +125,8 @@ class TrainerConfig:
     use_reward_to_go: bool
     use_actor_critic: bool
     use_ppo: bool
+    vf_coeff: float
+    ent_coeff: float
 
 
 class Actor:
@@ -188,24 +190,35 @@ def _concat_experiences(experiences: List[Experience]) -> Experience:
     )
 
 
-def run_actors(epoch: int, actors: List[Actor], config: TrainerConfig) -> Tuple[float, Experience]:
+def run_actors(
+    epoch: int, actors: List[Actor], config: TrainerConfig
+) -> Tuple[float, Experience]:
+    experiences = []
+    episode_reward = 0
     with futures.ProcessPoolExecutor(config.num_cpu) as executor:
         tasks = []
         for i, actor in enumerate(actors):
-            task = executor.submit(
-                actor.get_experience,
-                config.steps_per_epoch,
-                config.use_reward_to_go,
-                config.use_actor_critic,
-                i == 0 and config.render and epoch % 10 == 0,
-            )
-            tasks.append(task)
-        experiences = []
-        episode_reward = 0
-        for i, task in enumerate(tasks):
-            r, exp = task.result()
-            if i == 0:
+            if i != len(actors) - 1:
+                task = executor.submit(
+                    actor.get_experience,
+                    config.steps_per_epoch,
+                    config.use_reward_to_go,
+                    config.use_actor_critic,
+                    render=False
+                )
+                tasks.append(task)
+            else:
+                # To render the episode safely, we do not call fork for the last actor.
+                r, exp = actor.get_experience(
+                    config.steps_per_epoch,
+                    config.use_reward_to_go,
+                    config.use_actor_critic,
+                    config.render and epoch % 10 == 0,
+                )
+                experiences.append(exp)
                 episode_reward = r
+        for i, task in enumerate(tasks):
+            _, exp = task.result()
             experiences.append(exp)
     experience = _concat_experiences(experiences)
     return episode_reward, experience
@@ -234,16 +247,16 @@ class Trainer:
         for _ in range(self.config.updates_per_step):
             self.actor_optimizer.zero_grad()
             self.critic_optimizer.zero_grad()
-            actor_loss, critic_loss = _compute_loss(
+            actor_loss, entropy, critic_loss = _compute_loss(
                 self.ac, experience, self.config.use_actor_critic, self.config.use_ppo
             )
-            actor_loss.backward()
+            (actor_loss - self.config.ent_coeff * entropy).backward()
             self.actor_optimizer.step()
             average_actor_loss += (
                 actor_loss.detach().item() / self.config.updates_per_step
             )
             if critic_loss is not None:
-                critic_loss.backward()
+                (critic_loss * self.config.vf_coeff).backward()
                 self.critic_optimizer.step()
                 average_critic_loss += (
                     critic_loss.detach().item() / self.config.updates_per_step
@@ -265,19 +278,20 @@ class Trainer:
 
 def _compute_loss(
     ac: model.ActorCritic, experience: Experience, use_actor_critic: bool, use_ppo: bool
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    _, logp = ac.actor(experience.obs, experience.act)
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    pi, logp = ac.actor(experience.obs, experience.act)
     if use_actor_critic and use_ppo:
         ratio = torch.exp(logp - experience.logp)
         a = torch.clamp(ratio, 1 - 0.2, 1 + 0.2) * experience.advantages
         actor_loss = -(torch.min(ratio * experience.advantages, a)).mean()
     else:
         actor_loss = -(logp * experience.ret).mean()
+    entropy = pi.entropy().mean()
     critic_loss = None
     if use_actor_critic:
         values = ac.critic(experience.obs)
         critic_loss = F.mse_loss(values, experience.ret)
-    return actor_loss, critic_loss
+    return actor_loss, entropy, critic_loss
 
 
 @dataclasses.dataclass
@@ -299,6 +313,8 @@ def main():
     parser.add_argument("--disable_actor_critic", action="store_true")
     parser.add_argument("--disable_ppo", action="store_true")
     parser.add_argument("--num_cpu", type=int, default=4)
+    parser.add_argument("--vf_coeff", type=float, default=0.5)
+    parser.add_argument("--ent_coeff", type=float, default=0.01)
     args = parser.parse_args()
     env_fn = lambda: gym.make(args.env)
     env = env_fn()
@@ -317,6 +333,8 @@ def main():
             use_actor_critic=not args.disable_actor_critic,
             use_ppo=not args.disable_ppo,
             render=args.render,
+            vf_coeff=args.vf_coeff,
+            ent_coeff=args.ent_coeff,
         ),
     )
     trainer.train()
